@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+
+[tool.coverage.run]
+branch = true
+source = ["wyoming_bridge"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+]
+show_missing = true
+fail_under = 95
