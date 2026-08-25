@@ -17,14 +17,18 @@ import argparse
 import asyncio
 import json
 import logging
+import platform
+import plistlib
 import shutil
 import socket
 import subprocess
+import sys
 import wave
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 LOG = logging.getLogger("wyoming_bridge")
 
@@ -374,20 +378,212 @@ def check_wyoming_reachable(host: str, port: int, timeout: float = 3.0) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Saved config + optional background service (launchd on macOS, Task Scheduler
+# on Windows) so the bridge can start automatically instead of living in a
+# terminal window. All filesystem/process side effects go through the small
+# helpers below so tests can redirect or mock them individually.
+# ---------------------------------------------------------------------------
+
+CONFIG_DIR = Path.home() / ".wyoming_bridge"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+SERVICE_LABEL = "com.wychat.wyoming-bridge"
+WINDOWS_TASK_NAME = "WyomingBridge"
+
+
+def base_url_for(listen_host: str, listen_port: int) -> str:
+    return f"http://{listen_host}:{listen_port}/v1"
+
+
+def save_config(args: argparse.Namespace) -> Path:
+    """Persists the last-used settings and the TypeWhisper base URL to disk."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    config = {
+        "base_url": base_url_for(args.listen_host, args.listen_port),
+        "wyoming_host": args.wyoming_host,
+        "wyoming_port": args.wyoming_port,
+        "listen_host": args.listen_host,
+        "listen_port": args.listen_port,
+        "language": args.language,
+    }
+    CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    return CONFIG_PATH
+
+
+def copy_to_clipboard(text: str) -> bool:
+    """Best-effort clipboard copy; returns whether it worked."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+            return True
+        if system == "Windows":
+            subprocess.run(["clip"], input=text.encode("utf-8"), check=True)
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return False
+
+
+def _service_command_args(args: argparse.Namespace) -> List[str]:
+    command = [
+        sys.executable, str(Path(__file__).resolve()),
+        "--wyoming-host", args.wyoming_host,
+        "--wyoming-port", str(args.wyoming_port),
+        "--listen-host", args.listen_host,
+        "--listen-port", str(args.listen_port),
+        "--timeout", str(args.timeout),
+    ]
+    if args.language:
+        command += ["--language", args.language]
+    return command
+
+
+def _launchd_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}.plist"
+
+
+def _launchd_log_path() -> Path:
+    return Path.home() / "Library" / "Logs" / "wyoming-bridge.log"
+
+
+def _install_launchd(args: argparse.Namespace) -> None:
+    plist_path = _launchd_plist_path()
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path = _launchd_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    plist = {
+        "Label": SERVICE_LABEL,
+        "ProgramArguments": _service_command_args(args),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(log_path),
+        "StandardErrorPath": str(log_path),
+    }
+    with open(plist_path, "wb") as plist_file:
+        plistlib.dump(plist, plist_file)
+
+    subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True, check=False)
+    result = subprocess.run(["launchctl", "load", "-w", str(plist_path)], capture_output=True, check=False)
+    if result.returncode != 0:
+        LOG.error("launchctl load failed: %s", result.stderr.decode(errors="replace").strip())
+        raise SystemExit(1)
+
+    LOG.info("Installed a launchd service (%s) -- it will start at login and restart if it crashes.", SERVICE_LABEL)
+    LOG.info("Logs: %s", log_path)
+    LOG.info("To remove it: python3 %s --uninstall-service", Path(__file__).name)
+
+
+def _uninstall_launchd() -> None:
+    plist_path = _launchd_plist_path()
+    subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True, check=False)
+    if plist_path.exists():
+        plist_path.unlink()
+        LOG.info("Removed and unloaded the launchd service.")
+    else:
+        LOG.info("No launchd service was installed.")
+
+
+def _windows_wrapper_bat_path() -> Path:
+    return CONFIG_DIR / "run_wyoming_bridge.bat"
+
+
+def _install_windows_task(args: argparse.Namespace) -> None:
+    bat_path = _windows_wrapper_bat_path()
+    bat_path.parent.mkdir(parents=True, exist_ok=True)
+    command_line = subprocess.list2cmdline(_service_command_args(args))
+    bat_path.write_text(f"@echo off\r\n{command_line}\r\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "schtasks", "/Create", "/TN", WINDOWS_TASK_NAME,
+            "/TR", str(bat_path),
+            "/SC", "ONLOGON", "/RL", "LIMITED", "/F",
+        ],
+        capture_output=True, check=False,
+    )
+    if result.returncode != 0:
+        LOG.error("schtasks failed: %s", result.stderr.decode(errors="replace").strip())
+        raise SystemExit(1)
+
+    LOG.info("Installed a scheduled task (%s) -- it will start at logon.", WINDOWS_TASK_NAME)
+    LOG.info("To start it immediately: schtasks /Run /TN %s", WINDOWS_TASK_NAME)
+    LOG.info("To remove it: python wyoming_bridge.py --uninstall-service")
+
+
+def _uninstall_windows_task() -> None:
+    result = subprocess.run(
+        ["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"],
+        capture_output=True, check=False,
+    )
+    if result.returncode == 0:
+        LOG.info("Removed the scheduled task.")
+    else:
+        LOG.info("No scheduled task was installed (or it was already removed).")
+    bat_path = _windows_wrapper_bat_path()
+    if bat_path.exists():
+        bat_path.unlink()
+
+
+def install_service(args: argparse.Namespace) -> None:
+    system = platform.system()
+    if system == "Darwin":
+        _install_launchd(args)
+    elif system == "Windows":
+        _install_windows_task(args)
+    else:
+        LOG.error("Automatic background-service setup isn't implemented for %s.", system)
+        LOG.info("Run it manually instead: %s", " ".join(_service_command_args(args)))
+        raise SystemExit(1)
+
+
+def uninstall_service() -> None:
+    system = platform.system()
+    if system == "Darwin":
+        _uninstall_launchd()
+    elif system == "Windows":
+        _uninstall_windows_task()
+    else:
+        LOG.error("Automatic background-service setup isn't implemented for %s.", system)
+        raise SystemExit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--wyoming-host", required=True, help="Host/IP of the Wyoming ASR server (your Home Assistant box).")
+    parser.add_argument("--wyoming-host", default=None, help="Host/IP of the Wyoming ASR server (your Home Assistant box). Required unless --uninstall-service.")
     parser.add_argument("--wyoming-port", type=int, default=10300, help="Port of the Wyoming ASR server (default: 10300).")
     parser.add_argument("--listen-host", default="127.0.0.1", help="Local address to listen on (default: 127.0.0.1).")
     parser.add_argument("--listen-port", type=int, default=8765, help="Local port to listen on (default: 8765).")
     parser.add_argument("--language", default=None, help="Force a language code (e.g. 'en') for every request.")
     parser.add_argument("--timeout", type=float, default=60.0, help="Seconds to wait for the Wyoming server (default: 60).")
     parser.add_argument("--selftest", action="store_true", help="Send one second of silence directly to the Wyoming server and exit, without starting the HTTP server.")
+    parser.add_argument("--install-service", action="store_true", help="Install a background service (launchd on macOS, Task Scheduler on Windows) that runs the bridge automatically, then exit.")
+    parser.add_argument("--uninstall-service", action="store_true", help="Remove a previously installed background service, then exit.")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.uninstall_service:
+        uninstall_service()
+        return
+
+    if args.wyoming_host is None:
+        parser.error("--wyoming-host is required (unless using --uninstall-service).")
+
     args.wyoming_host = normalize_host(args.wyoming_host)
+
+    if args.install_service:
+        check_wyoming_reachable(args.wyoming_host, args.wyoming_port)
+        save_config(args)
+        install_service(args)
+        base_url = base_url_for(args.listen_host, args.listen_port)
+        if copy_to_clipboard(base_url):
+            LOG.info("Copied %s to your clipboard -- paste it into TypeWhisper's base URL field.", base_url)
+        else:
+            LOG.info("TypeWhisper base URL: %s", base_url)
+        return
 
     if args.selftest:
         LOG.info("Sending 1 second of silence to %s:%d ...", args.wyoming_host, args.wyoming_port)
@@ -402,6 +598,7 @@ def main() -> None:
         return
 
     check_wyoming_reachable(args.wyoming_host, args.wyoming_port)
+    config_path = save_config(args)
 
     BridgeHandler.wyoming_host = args.wyoming_host
     BridgeHandler.wyoming_port = args.wyoming_port
@@ -409,9 +606,11 @@ def main() -> None:
     BridgeHandler.request_timeout = args.timeout
 
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), BridgeHandler)
+    base_url = base_url_for(args.listen_host, args.listen_port)
     LOG.info("Wyoming bridge listening on http://%s:%d", args.listen_host, args.listen_port)
     LOG.info("Forwarding transcription requests to Wyoming server at %s:%d", args.wyoming_host, args.wyoming_port)
-    LOG.info("In TypeWhisper, set the 'OpenAI Compatible' engine's base URL to: http://%s:%d/v1", args.listen_host, args.listen_port)
+    LOG.info("In TypeWhisper, set the 'OpenAI Compatible' engine's base URL to: %s", base_url)
+    LOG.info("(Settings saved to %s for next time.)", config_path)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -420,5 +619,5 @@ def main() -> None:
         server.shutdown()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()
