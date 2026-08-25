@@ -18,6 +18,7 @@ import threading
 import wave
 from http.client import HTTPConnection
 from io import BytesIO
+from typing import cast
 
 import pytest
 
@@ -43,6 +44,11 @@ class FakeWriter:
 
     async def drain(self) -> None:
         pass
+
+
+def as_stream_writer(writer: "FakeWriter") -> asyncio.StreamWriter:
+    """_write_event only needs .write()/.drain(); this satisfies the type checker for that duck type."""
+    return cast(asyncio.StreamWriter, writer)
 
 
 def make_reader(data: bytes) -> asyncio.StreamReader:
@@ -144,7 +150,7 @@ def close_without_responding(_events):
 @run_async
 async def test_write_event_header_only_has_no_length_fields():
     writer = FakeWriter()
-    await wb._write_event(writer, "audio-stop")
+    await wb._write_event(as_stream_writer(writer), "audio-stop")
     line, rest = bytes(writer.buffer).split(b"\n", 1)
     header = json.loads(line)
     assert header == {"type": "audio-stop"}
@@ -154,7 +160,7 @@ async def test_write_event_header_only_has_no_length_fields():
 @run_async
 async def test_write_event_empty_data_dict_omits_data_length():
     writer = FakeWriter()
-    await wb._write_event(writer, "audio-stop", data={})
+    await wb._write_event(as_stream_writer(writer), "audio-stop", data={})
     header = json.loads(bytes(writer.buffer).split(b"\n", 1)[0])
     assert "data_length" not in header
 
@@ -162,7 +168,7 @@ async def test_write_event_empty_data_dict_omits_data_length():
 @run_async
 async def test_write_event_with_data_only():
     writer = FakeWriter()
-    await wb._write_event(writer, "transcribe", data={"language": "en"})
+    await wb._write_event(as_stream_writer(writer), "transcribe", data={"language": "en"})
     line, rest = bytes(writer.buffer).split(b"\n", 1)
     header = json.loads(line)
     assert header["data_length"] == len(rest)
@@ -173,7 +179,7 @@ async def test_write_event_with_data_only():
 @run_async
 async def test_write_event_with_payload_only():
     writer = FakeWriter()
-    await wb._write_event(writer, "audio-chunk", payload=b"abc")
+    await wb._write_event(as_stream_writer(writer), "audio-chunk", payload=b"abc")
     line, rest = bytes(writer.buffer).split(b"\n", 1)
     header = json.loads(line)
     assert "data_length" not in header
@@ -185,7 +191,7 @@ async def test_write_event_with_payload_only():
 async def test_write_event_with_data_and_payload_are_ordered_correctly():
     writer = FakeWriter()
     data = {"rate": 16000, "width": 2, "channels": 1}
-    await wb._write_event(writer, "audio-chunk", data=data, payload=b"PCM!")
+    await wb._write_event(as_stream_writer(writer), "audio-chunk", data=data, payload=b"PCM!")
     line, rest = bytes(writer.buffer).split(b"\n", 1)
     header = json.loads(line)
     data_bytes = json.dumps(data).encode("utf-8")
@@ -210,7 +216,9 @@ async def test_read_event_type_only():
 @run_async
 async def test_read_event_with_data():
     reader = make_reader(encode_event("transcript", data={"text": "hi"}))
-    event_type, data, payload = await wb._read_event(reader)
+    result = await wb._read_event(reader)
+    assert result is not None
+    event_type, data, payload = result
     assert event_type == "transcript"
     assert data == {"text": "hi"}
     assert payload is None
@@ -219,7 +227,9 @@ async def test_read_event_with_data():
 @run_async
 async def test_read_event_with_payload():
     reader = make_reader(encode_event("audio-chunk", payload=b"xyz"))
-    _type, data, payload = await wb._read_event(reader)
+    result = await wb._read_event(reader)
+    assert result is not None
+    _type, data, payload = result
     assert data == {}
     assert payload == b"xyz"
 
@@ -227,7 +237,9 @@ async def test_read_event_with_payload():
 @run_async
 async def test_read_event_with_data_and_payload():
     reader = make_reader(encode_event("audio-chunk", data={"rate": 16000}, payload=b"xyz"))
-    event_type, data, payload = await wb._read_event(reader)
+    result = await wb._read_event(reader)
+    assert result is not None
+    event_type, data, payload = result
     assert event_type == "audio-chunk"
     assert data == {"rate": 16000}
     assert payload == b"xyz"
@@ -237,7 +249,9 @@ async def test_read_event_with_data_and_payload():
 async def test_read_event_explicit_zero_lengths_are_treated_as_absent():
     header = json.dumps({"type": "audio-stop", "data_length": 0, "payload_length": 0}).encode() + b"\n"
     reader = make_reader(header)
-    event_type, data, payload = await wb._read_event(reader)
+    result = await wb._read_event(reader)
+    assert result is not None
+    event_type, data, payload = result
     assert event_type == "audio-stop"
     assert data == {}
     assert payload is None
@@ -511,8 +525,9 @@ def build_multipart_body(boundary: bytes, parts) -> bytes:
 
 def test_parse_multipart_extracts_file_and_text_fields():
     boundary = b"BOUND123"
+    file_headers = b'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\nContent-Type: audio/wav'
     body = build_multipart_body(boundary, [
-        (b'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\nContent-Type: audio/wav', b"\x00\x01BINARY\r\nwithembeddedcrlf"),
+        (file_headers, b"\x00\x01BINARY\r\nwithembeddedcrlf"),
         (b'Content-Disposition: form-data; name="language"', b"en"),
     ])
     fields = wb.parse_multipart(body, boundary)
@@ -633,6 +648,12 @@ def multipart_request_body(fields: dict, file_field=None):
     return body, f"multipart/form-data; boundary={boundary}"
 
 
+def post_transcription(bridge, body, content_type):
+    return bridge.request(
+        "POST", "/v1/audio/transcriptions", body=body, headers={"Content-Type": content_type}
+    )
+
+
 def test_do_get_root(bridge):
     status, payload = bridge.request("GET", "/")
     assert status == 200
@@ -660,7 +681,9 @@ def test_do_post_unknown_path_is_404(bridge):
 
 def test_do_post_translate_path_is_400(bridge):
     body, content_type = multipart_request_body({}, file_field=("a.wav", "audio/wav", make_wav_bytes()))
-    status, payload = bridge.request("POST", "/v1/audio/translations", body=body, headers={"Content-Type": content_type})
+    status, payload = bridge.request(
+        "POST", "/v1/audio/translations", body=body, headers={"Content-Type": content_type}
+    )
     assert status == 400
     assert "translation" in payload["error"]
 
@@ -675,7 +698,7 @@ def test_do_post_without_multipart_content_type_is_400(bridge):
 
 def test_do_post_missing_file_field_is_400(bridge):
     body, content_type = multipart_request_body({"model": "whisper-1"})
-    status, payload = bridge.request("POST", "/v1/audio/transcriptions", body=body, headers={"Content-Type": content_type})
+    status, payload = post_transcription(bridge, body, content_type)
     assert status == 400
     assert "file" in payload["error"]
 
@@ -684,7 +707,7 @@ def test_do_post_success_uses_per_request_language(bridge):
     body, content_type = multipart_request_body(
         {"model": "whisper-1", "language": "en"}, file_field=("a.wav", "audio/wav", make_wav_bytes())
     )
-    status, payload = bridge.request("POST", "/v1/audio/transcriptions", body=body, headers={"Content-Type": content_type})
+    status, payload = post_transcription(bridge, body, content_type)
     assert status == 200
     assert payload["text"] == "received ok"
 
@@ -695,7 +718,7 @@ def test_do_post_forced_language_overrides_request_field(bridge):
         body, content_type = multipart_request_body(
             {"language": "en"}, file_field=("a.wav", "audio/wav", make_wav_bytes())
         )
-        status, _payload = bridge.request("POST", "/v1/audio/transcriptions", body=body, headers={"Content-Type": content_type})
+        status, _payload = post_transcription(bridge, body, content_type)
         assert status == 200
     finally:
         wb.BridgeHandler.forced_language = None
@@ -704,7 +727,7 @@ def test_do_post_forced_language_overrides_request_field(bridge):
 def test_do_post_unsupported_audio_is_415(bridge, monkeypatch):
     monkeypatch.setattr(wb.shutil, "which", lambda name: None)
     body, content_type = multipart_request_body({}, file_field=("clip.m4a", "audio/mp4", b"\x00\x01\x02not really wav"))
-    status, payload = bridge.request("POST", "/v1/audio/transcriptions", body=body, headers={"Content-Type": content_type})
+    status, payload = post_transcription(bridge, body, content_type)
     assert status == 415
     assert "ffmpeg" in payload["error"]
 
@@ -712,7 +735,7 @@ def test_do_post_unsupported_audio_is_415(bridge, monkeypatch):
 def test_do_post_wyoming_unreachable_is_502(bridge):
     wb.BridgeHandler.wyoming_port = 1  # nothing listens on a privileged port we didn't bind
     body, content_type = multipart_request_body({}, file_field=("a.wav", "audio/wav", make_wav_bytes()))
-    status, payload = bridge.request("POST", "/v1/audio/transcriptions", body=body, headers={"Content-Type": content_type})
+    status, payload = post_transcription(bridge, body, content_type)
     assert status == 502
     assert "Wyoming server error" in payload["error"]
 
@@ -784,11 +807,11 @@ def test_base_url_for():
 
 
 def make_args(**overrides):
-    defaults = dict(
-        wyoming_host="192.168.7.47", wyoming_port=10300,
-        listen_host="127.0.0.1", listen_port=8765,
-        language=None, timeout=60.0,
-    )
+    defaults = {
+        "wyoming_host": "192.168.7.47", "wyoming_port": 10300,
+        "listen_host": "127.0.0.1", "listen_port": 8765,
+        "language": None, "timeout": 60.0,
+    }
     defaults.update(overrides)
     return wb.argparse.Namespace(**defaults)
 
@@ -999,6 +1022,155 @@ def test_uninstall_service_unsupported_platform_raises(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Interactive setup wizard
+# ---------------------------------------------------------------------------
+
+def scripted_input(monkeypatch, answers):
+    queue = list(answers)
+
+    def fake_input(_prompt=""):
+        return queue.pop(0)
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+
+def test_prompt_returns_typed_answer(monkeypatch):
+    scripted_input(monkeypatch, ["hello"])
+    assert wb._prompt("Question", default="fallback") == "hello"
+
+
+def test_prompt_returns_default_when_blank(monkeypatch):
+    scripted_input(monkeypatch, [""])
+    assert wb._prompt("Question", default="fallback") == "fallback"
+
+
+@pytest.mark.parametrize(
+    "answer,default,expected",
+    [
+        ("", False, False),
+        ("", True, True),
+        ("y", False, True),
+        ("yes", False, True),
+        ("Y", False, True),
+        ("n", True, False),
+        ("anything-else", True, False),
+    ],
+)
+def test_prompt_yes_no(monkeypatch, answer, default, expected):
+    scripted_input(monkeypatch, [answer])
+    assert wb._prompt_yes_no("Question?", default=default) is expected
+
+
+@pytest.mark.parametrize(
+    "system,which_map,expected",
+    [
+        ("Darwin", {"brew": "/opt/homebrew/bin/brew"}, ("brew", "install", "ffmpeg")),
+        ("Darwin", {}, None),
+        ("Windows", {"winget": "C:\\winget.exe"}, ("winget", "install", "ffmpeg")),
+        ("Windows", {}, None),
+        ("Linux", {"brew": "/usr/bin/brew"}, None),
+    ],
+)
+def test_detect_package_manager(monkeypatch, system, which_map, expected):
+    monkeypatch.setattr(wb.platform, "system", lambda: system)
+    monkeypatch.setattr(wb.shutil, "which", lambda name: which_map.get(name))
+    assert wb._detect_package_manager() == expected
+
+
+def test_offer_ffmpeg_install_skips_when_already_installed(monkeypatch):
+    monkeypatch.setattr(wb.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+    calls = []
+    monkeypatch.setattr(wb.subprocess, "run", lambda *a, **k: calls.append(a))
+    wb._offer_ffmpeg_install()
+    assert calls == []
+
+
+def test_offer_ffmpeg_install_prints_manual_link_without_package_manager(monkeypatch, capsys):
+    monkeypatch.setattr(wb.shutil, "which", lambda name: None)
+    monkeypatch.setattr(wb, "_detect_package_manager", lambda: None)
+    calls = []
+    monkeypatch.setattr(wb.subprocess, "run", lambda *a, **k: calls.append(a))
+    wb._offer_ffmpeg_install()
+    assert calls == []
+    assert "ffmpeg.org" in capsys.readouterr().out
+
+
+def test_offer_ffmpeg_install_runs_installer_when_confirmed(monkeypatch):
+    monkeypatch.setattr(wb.shutil, "which", lambda name: None)
+    monkeypatch.setattr(wb, "_detect_package_manager", lambda: ("brew", "install", "ffmpeg"))
+    scripted_input(monkeypatch, ["y"])
+    calls = []
+    monkeypatch.setattr(wb.subprocess, "run", lambda argv, **k: calls.append(argv))
+    wb._offer_ffmpeg_install()
+    assert calls == [("brew", "install", "ffmpeg")]
+
+
+def test_offer_ffmpeg_install_skips_installer_when_declined(monkeypatch):
+    monkeypatch.setattr(wb.shutil, "which", lambda name: None)
+    monkeypatch.setattr(wb, "_detect_package_manager", lambda: ("brew", "install", "ffmpeg"))
+    scripted_input(monkeypatch, ["n"])
+    calls = []
+    monkeypatch.setattr(wb.subprocess, "run", lambda *a, **k: calls.append(a))
+    wb._offer_ffmpeg_install()
+    assert calls == []
+
+
+def test_run_setup_wizard_reprompts_until_host_given(monkeypatch, tmp_path):
+    monkeypatch.setattr(wb, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(wb, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr(wb, "check_wyoming_reachable", lambda host, port: None)
+    monkeypatch.setattr(wb, "_offer_ffmpeg_install", lambda: None)
+    scripted_input(monkeypatch, ["", "192.168.7.47", "", "", "", "n"])
+    initial = make_args(wyoming_host=None)
+    wb.run_setup_wizard(initial)
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert saved["wyoming_host"] == "192.168.7.47"
+
+
+def test_run_setup_wizard_installs_service_and_copies_url(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(wb, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(wb, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr(wb, "check_wyoming_reachable", lambda host, port: None)
+    monkeypatch.setattr(wb, "_offer_ffmpeg_install", lambda: None)
+    install_calls = []
+    monkeypatch.setattr(wb, "install_service", lambda args: install_calls.append(args))
+    monkeypatch.setattr(wb, "copy_to_clipboard", lambda text: True)
+    # host, wyoming port (blank = default), listen port (blank = default), language (blank), install service? yes
+    scripted_input(monkeypatch, ["192.168.7.47", "", "", "", "y"])
+    wb.run_setup_wizard(make_args())
+    assert len(install_calls) == 1
+    assert install_calls[0].wyoming_host == "192.168.7.47"
+    assert "Copied" in capsys.readouterr().out
+
+
+def test_run_setup_wizard_installs_service_prints_url_when_clipboard_unavailable(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(wb, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(wb, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr(wb, "check_wyoming_reachable", lambda host, port: None)
+    monkeypatch.setattr(wb, "_offer_ffmpeg_install", lambda: None)
+    monkeypatch.setattr(wb, "install_service", lambda args: None)
+    monkeypatch.setattr(wb, "copy_to_clipboard", lambda text: False)
+    scripted_input(monkeypatch, ["192.168.7.47", "", "", "", "y"])
+    wb.run_setup_wizard(make_args())
+    assert "TypeWhisper base URL" in capsys.readouterr().out
+
+
+def test_run_setup_wizard_declines_service_prints_manual_command(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(wb, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(wb, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr(wb, "check_wyoming_reachable", lambda host, port: None)
+    monkeypatch.setattr(wb, "_offer_ffmpeg_install", lambda: None)
+    install_calls = []
+    monkeypatch.setattr(wb, "install_service", lambda args: install_calls.append(args))
+    scripted_input(monkeypatch, ["192.168.7.47", "", "", "en", "n"])
+    wb.run_setup_wizard(make_args())
+    assert install_calls == []
+    out = capsys.readouterr().out
+    assert "Run it with:" in out
+    assert "TypeWhisper base URL" in out
+
+
+# ---------------------------------------------------------------------------
 # main() -- CLI wiring; underlying behavior is mocked since it's covered above
 # ---------------------------------------------------------------------------
 
@@ -1018,6 +1190,14 @@ def test_main_requires_wyoming_host_unless_uninstalling(monkeypatch):
     with pytest.raises(SystemExit) as excinfo:
         run_main(monkeypatch, [])
     assert excinfo.value.code == 2
+
+
+def test_main_setup_dispatch_does_not_require_wyoming_host(monkeypatch):
+    calls = []
+    monkeypatch.setattr(wb, "run_setup_wizard", lambda args: calls.append(args))
+    run_main(monkeypatch, ["--setup"])
+    assert len(calls) == 1
+    assert calls[0].wyoming_host is None
 
 
 def test_main_install_service_dispatch_copies_to_clipboard(monkeypatch, caplog):

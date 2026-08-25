@@ -2,10 +2,16 @@
 """Bridges TypeWhisper's "OpenAI Compatible" transcription engine to a Wyoming ASR server.
 
 Run this next to (or on the same machine as) TypeWhisper, pointed at the Wyoming
-Whisper add-on on your Home Assistant box:
+Whisper add-on on your Home Assistant box. Either run it directly:
 
-    python3 wyoming_bridge.py --wyoming-host 192.168.1.50
+    python3 wyoming_bridge.py --setup
 
+or, after `pip install .`, via the installed command:
+
+    wyoming-bridge --setup
+
+`--setup` walks through the settings interactively and can install a background
+service (launchd on macOS, Task Scheduler on Windows) so it starts automatically.
 Then in TypeWhisper, set the transcription engine to "OpenAI Compatible" with a
 base URL of http://127.0.0.1:8765/v1 (any API key / model value works, they are
 ignored). See README.md for the full walkthrough.
@@ -15,6 +21,7 @@ Wire format reference: https://github.com/rhasspy/wyoming
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import platform
@@ -28,7 +35,6 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional
 
 LOG = logging.getLogger("wyoming_bridge")
 
@@ -51,8 +57,13 @@ class UnsupportedAudioError(Exception):
 # rhasspy/wyoming's event.py, not just the informal docs.
 # ---------------------------------------------------------------------------
 
-async def _write_event(writer: asyncio.StreamWriter, event_type: str, data: Optional[dict] = None, payload: Optional[bytes] = None) -> None:
-    header: Dict[str, object] = {"type": event_type}
+async def _write_event(
+    writer: asyncio.StreamWriter,
+    event_type: str,
+    data: dict | None = None,
+    payload: bytes | None = None,
+) -> None:
+    header: dict[str, object] = {"type": event_type}
 
     data_bytes = None
     if data:
@@ -89,7 +100,13 @@ async def _read_event(reader: asyncio.StreamReader):
     return header["type"], data, payload
 
 
-async def wyoming_transcribe(host: str, port: int, pcm_audio: bytes, language: Optional[str] = None, timeout: float = 60.0) -> str:
+async def wyoming_transcribe(
+    host: str,
+    port: int,
+    pcm_audio: bytes,
+    language: str | None = None,
+    timeout: float = 60.0,
+) -> str:
     """Sends 16kHz/mono/16-bit PCM audio to a Wyoming ASR server, returns the transcript text.
 
     Opens a fresh connection per call -- the reference server closes the
@@ -123,10 +140,8 @@ async def wyoming_transcribe(host: str, port: int, pcm_audio: bytes, language: O
             # Ignore anything else (e.g. an info/describe reply) and keep waiting.
     finally:
         writer.close()
-        try:
+        with contextlib.suppress(Exception):
             await writer.wait_closed()
-        except Exception:
-            pass
 
 
 async def wyoming_describe(host: str, port: int, timeout: float = 5.0) -> str:
@@ -140,10 +155,8 @@ async def wyoming_describe(host: str, port: int, timeout: float = 5.0) -> str:
         return event[0]
     finally:
         writer.close()
-        try:
+        with contextlib.suppress(Exception):
             await writer.wait_closed()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +165,7 @@ async def wyoming_describe(host: str, port: int, timeout: float = 5.0) -> str:
 # requests here will actually be WAV. ffmpeg (if present) covers everything else.
 # ---------------------------------------------------------------------------
 
-def pcm_from_upload(file_bytes: bytes, filename: Optional[str], content_type: Optional[str]) -> bytes:
+def pcm_from_upload(file_bytes: bytes, filename: str | None, content_type: str | None) -> bytes:
     looks_like_wav = (
         file_bytes[:4] == b"RIFF"
         or (content_type or "").lower() in ("audio/wav", "audio/x-wav", "audio/wave")
@@ -173,7 +186,10 @@ def _extract_wav_pcm(wav_bytes: bytes) -> bytes:
     if (rate, width, channels) == (WYOMING_SAMPLE_RATE, WYOMING_SAMPLE_WIDTH, WYOMING_CHANNELS):
         return frames
 
-    LOG.debug("Uploaded WAV is %dHz/%d-byte/%dch, not the expected 16kHz/16-bit/mono -- transcoding.", rate, width, channels)
+    LOG.debug(
+        "Uploaded WAV is %dHz/%d-byte/%dch, not the expected 16kHz/16-bit/mono -- transcoding.",
+        rate, width, channels,
+    )
     return _transcode_with_ffmpeg(wav_bytes)
 
 
@@ -193,12 +209,12 @@ def _transcode_with_ffmpeg(audio_bytes: bytes) -> bytes:
             "-",
         ],
         input=audio_bytes,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     if result.returncode != 0 or not result.stdout:
-        raise UnsupportedAudioError(f"ffmpeg could not decode the uploaded audio: {result.stderr.decode(errors='replace').strip()}")
+        stderr = result.stderr.decode(errors="replace").strip()
+        raise UnsupportedAudioError(f"ffmpeg could not decode the uploaded audio: {stderr}")
     return result.stdout
 
 
@@ -209,14 +225,14 @@ def _transcode_with_ffmpeg(audio_bytes: bytes) -> bytes:
 @dataclass
 class MultipartField:
     content: bytes
-    filename: Optional[str]
-    content_type: Optional[str]
+    filename: str | None
+    content_type: str | None
 
 
-def parse_multipart(body: bytes, boundary: bytes) -> Dict[str, MultipartField]:
+def parse_multipart(body: bytes, boundary: bytes) -> dict[str, MultipartField]:
     delimiter = b"--" + boundary
     chunks = body.split(delimiter)
-    fields: Dict[str, MultipartField] = {}
+    fields: dict[str, MultipartField] = {}
 
     # chunks[0] is the preamble before the first boundary; the last chunk is the
     # closing "--\r\n" marker. Both are skipped by only iterating the middle ones.
@@ -262,7 +278,7 @@ def _parse_content_disposition(value: str):
 class BridgeHandler(BaseHTTPRequestHandler):
     wyoming_host = ""
     wyoming_port = 10300
-    forced_language: Optional[str] = None
+    forced_language: str | None = None
     request_timeout = 60.0
 
     server_version = "WyomingBridge/1.0"
@@ -279,7 +295,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?", 1)[0]
         if path.endswith("/audio/translations"):
-            self._send_json(400, {"error": "Wyoming's ASR protocol has no translation mode -- only plain transcription is supported."})
+            self._send_json(400, {
+                "error": "Wyoming's ASR protocol has no translation mode -- only plain transcription is supported.",
+            })
             return
         if not path.endswith("/audio/transcriptions"):
             self._send_json(404, {"error": f"Unknown endpoint: {self.path}"})
@@ -346,7 +364,10 @@ def normalize_host(raw_host: str) -> str:
 
     for scheme in ("http://", "https://", "tcp://"):
         if host.lower().startswith(scheme):
-            LOG.warning("--wyoming-host had a %r prefix -- stripping it. Pass just the bare hostname or IP, e.g. 192.168.7.55.", scheme)
+            LOG.warning(
+                "--wyoming-host had a %r prefix -- stripping it. Pass just the bare hostname or IP, e.g. 192.168.7.55.",
+                scheme,
+            )
             host = host[len(scheme):]
             break
 
@@ -425,7 +446,7 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
-def _service_command_args(args: argparse.Namespace) -> List[str]:
+def _service_command_args(args: argparse.Namespace) -> list[str]:
     command = [
         sys.executable, str(Path(__file__).resolve()),
         "--wyoming-host", args.wyoming_host,
@@ -549,28 +570,153 @@ def uninstall_service() -> None:
         raise SystemExit(1)
 
 
+# ---------------------------------------------------------------------------
+# Interactive setup wizard (`--setup`): prompts for the settings above instead
+# of requiring them all as flags, and optionally offers to install ffmpeg via
+# the system's own package manager (never a bundled/downloaded binary).
+# ---------------------------------------------------------------------------
+
+def _prompt(question: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    answer = input(f"{question}{suffix}: ").strip()
+    return answer or default
+
+
+def _prompt_yes_no(question: str, default: bool = False) -> bool:
+    label = "Y/n" if default else "y/N"
+    answer = input(f"{question} [{label}]: ").strip().lower()
+    if not answer:
+        return default
+    return answer in ("y", "yes")
+
+
+def _detect_package_manager() -> tuple[str, ...] | None:
+    system = platform.system()
+    if system == "Darwin" and shutil.which("brew"):
+        return ("brew", "install", "ffmpeg")
+    if system == "Windows" and shutil.which("winget"):
+        return ("winget", "install", "ffmpeg")
+    return None
+
+
+def _offer_ffmpeg_install() -> None:
+    if shutil.which("ffmpeg") is not None:
+        return
+    print(
+        "\nffmpeg isn't installed. It's optional -- only used as a fallback for non-WAV audio "
+        "uploads -- but installing it avoids one extra round trip on every dictation."
+    )
+    command = _detect_package_manager()
+    if command is None:
+        print("Install it yourself when convenient: https://ffmpeg.org/download.html")
+        return
+    if _prompt_yes_no(f"Install it now with '{' '.join(command)}'?"):
+        subprocess.run(command, check=False)
+
+
+def run_setup_wizard(initial_args: argparse.Namespace) -> None:
+    print("Wyoming bridge setup")
+    print("=====================")
+
+    wyoming_host = ""
+    while not wyoming_host:
+        wyoming_host = normalize_host(
+            _prompt("Wyoming server host/IP (your Home Assistant box)", initial_args.wyoming_host or "")
+        )
+
+    wyoming_port = int(_prompt("Wyoming server port", str(initial_args.wyoming_port)))
+    listen_port = int(_prompt("Local port for TypeWhisper to connect to", str(initial_args.listen_port)))
+    language = _prompt("Force a language code, e.g. 'en' (blank = auto-detect)", initial_args.language or "") or None
+
+    args = argparse.Namespace(
+        wyoming_host=wyoming_host, wyoming_port=wyoming_port,
+        listen_host=initial_args.listen_host, listen_port=listen_port,
+        language=language, timeout=initial_args.timeout,
+    )
+
+    print(f"\nChecking {wyoming_host}:{wyoming_port} ...")
+    check_wyoming_reachable(wyoming_host, wyoming_port)
+
+    _offer_ffmpeg_install()
+
+    config_path = save_config(args)
+    print(f"\nSettings saved to {config_path}")
+
+    base_url = base_url_for(args.listen_host, args.listen_port)
+    if _prompt_yes_no("Install a background service so this starts automatically at login?", default=True):
+        install_service(args)
+        if copy_to_clipboard(base_url):
+            print(f"Copied {base_url} to your clipboard -- paste it into TypeWhisper's base URL field.")
+        else:
+            print(f"TypeWhisper base URL: {base_url}")
+    else:
+        print(f"\nRun it with: {' '.join(_service_command_args(args))}")
+        print(f"TypeWhisper base URL: {base_url}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--wyoming-host", default=None, help="Host/IP of the Wyoming ASR server (your Home Assistant box). Required unless --uninstall-service.")
-    parser.add_argument("--wyoming-port", type=int, default=10300, help="Port of the Wyoming ASR server (default: 10300).")
-    parser.add_argument("--listen-host", default="127.0.0.1", help="Local address to listen on (default: 127.0.0.1).")
-    parser.add_argument("--listen-port", type=int, default=8765, help="Local port to listen on (default: 8765).")
-    parser.add_argument("--language", default=None, help="Force a language code (e.g. 'en') for every request.")
-    parser.add_argument("--timeout", type=float, default=60.0, help="Seconds to wait for the Wyoming server (default: 60).")
-    parser.add_argument("--selftest", action="store_true", help="Send one second of silence directly to the Wyoming server and exit, without starting the HTTP server.")
-    parser.add_argument("--install-service", action="store_true", help="Install a background service (launchd on macOS, Task Scheduler on Windows) that runs the bridge automatically, then exit.")
-    parser.add_argument("--uninstall-service", action="store_true", help="Remove a previously installed background service, then exit.")
+    parser.add_argument(
+        "--wyoming-host", default=None,
+        help="Host/IP of the Wyoming ASR server. Not needed with --setup/--uninstall-service.",
+    )
+    parser.add_argument(
+        "--wyoming-port", type=int, default=10300,
+        help="Port of the Wyoming ASR server (default: 10300).",
+    )
+    parser.add_argument(
+        "--listen-host", default="127.0.0.1",
+        help="Local address to listen on (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--listen-port", type=int, default=8765,
+        help="Local port to listen on (default: 8765).",
+    )
+    parser.add_argument(
+        "--language", default=None,
+        help="Force a language code (e.g. 'en') for every request.",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=60.0,
+        help="Seconds to wait for the Wyoming server (default: 60).",
+    )
+    parser.add_argument(
+        "--setup", action="store_true",
+        help="Interactively prompt for settings, save them, and optionally install the background service.",
+    )
+    parser.add_argument(
+        "--selftest", action="store_true",
+        help="Send one second of silence directly to the Wyoming server and exit, without starting the HTTP server.",
+    )
+    parser.add_argument(
+        "--install-service", action="store_true",
+        help=(
+            "Install a background service (launchd on macOS, Task Scheduler on Windows) that "
+            "runs the bridge automatically, then exit."
+        ),
+    )
+    parser.add_argument(
+        "--uninstall-service", action="store_true",
+        help="Remove a previously installed background service, then exit.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 
     if args.uninstall_service:
         uninstall_service()
         return
 
+    if args.setup:
+        run_setup_wizard(args)
+        return
+
     if args.wyoming_host is None:
-        parser.error("--wyoming-host is required (unless using --uninstall-service).")
+        parser.error("--wyoming-host is required (unless using --setup/--uninstall-service).")
 
     args.wyoming_host = normalize_host(args.wyoming_host)
 
@@ -589,10 +735,13 @@ def main() -> None:
         LOG.info("Sending 1 second of silence to %s:%d ...", args.wyoming_host, args.wyoming_port)
         silence = b"\x00" * (WYOMING_SAMPLE_RATE * WYOMING_SAMPLE_WIDTH)
         try:
-            text = asyncio.run(wyoming_transcribe(args.wyoming_host, args.wyoming_port, silence, language=args.language, timeout=args.timeout))
+            text = asyncio.run(wyoming_transcribe(
+                args.wyoming_host, args.wyoming_port, silence,
+                language=args.language, timeout=args.timeout,
+            ))
         except Exception as error:
             LOG.error("Self-test failed: %s", error)
-            raise SystemExit(1)
+            raise SystemExit(1) from error
         LOG.info("Self-test succeeded -- the server responded with transcript: %r", text)
         LOG.info("(An empty string is normal for silence; the point is that the round trip worked.)")
         return
