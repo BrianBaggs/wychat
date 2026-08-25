@@ -332,6 +332,36 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def normalize_host(raw_host: str) -> str:
+    """Tolerates common paste mistakes: a URL scheme, a trailing path, or an embedded port.
+
+    --wyoming-host wants a bare hostname/IP for a raw TCP connection, but it's an easy slip to
+    paste something URL-shaped instead (TypeWhisper's own base URL field does want a full URL).
+    """
+    host = raw_host.strip()
+
+    for scheme in ("http://", "https://", "tcp://"):
+        if host.lower().startswith(scheme):
+            LOG.warning("--wyoming-host had a %r prefix -- stripping it. Pass just the bare hostname or IP, e.g. 192.168.7.55.", scheme)
+            host = host[len(scheme):]
+            break
+
+    if "/" in host:
+        host = host.split("/", 1)[0]
+
+    if ":" in host:
+        host_part, _, port_part = host.rpartition(":")
+        if host_part and port_part.isdigit():
+            LOG.warning(
+                "--wyoming-host had a port attached (:%s) -- ignoring it. Pass --wyoming-port %s instead "
+                "if that's really your Wyoming server's port (the Whisper add-on default is 10300).",
+                port_part, port_part,
+            )
+            host = host_part
+
+    return host
+
+
 def check_wyoming_reachable(host: str, port: int, timeout: float = 3.0) -> None:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -357,6 +387,7 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args.wyoming_host = normalize_host(args.wyoming_host)
 
     if args.selftest:
         LOG.info("Sending 1 second of silence to %s:%d ...", args.wyoming_host, args.wyoming_port)
