@@ -514,7 +514,10 @@ def _install_windows_task(args: argparse.Namespace) -> None:
     bat_path = _windows_wrapper_bat_path()
     bat_path.parent.mkdir(parents=True, exist_ok=True)
     command_line = subprocess.list2cmdline(_service_command_args(args))
-    bat_path.write_text(f"@echo off\r\n{command_line}\r\n", encoding="utf-8")
+    # newline="" disables write-side newline translation -- without it, Path.write_text()
+    # expands each "\n" to os.linesep, which is itself "\r\n" on Windows, doubling our
+    # already-literal \r into "\r\r\n".
+    bat_path.write_text(f"@echo off\r\n{command_line}\r\n", encoding="utf-8", newline="")
 
     result = subprocess.run(
         [
