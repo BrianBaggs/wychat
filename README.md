@@ -40,6 +40,7 @@ git clone <this-repo-url> wychat
 cd wychat
 pip install .
 ```
+OR instead of pip you can replace it with pipx if you need to.
 
 This installs the bridge and a `wyoming-bridge` command on your `PATH`. (A virtual environment
 is recommended, as always: `python3 -m venv .venv && source .venv/bin/activate` first, or the
